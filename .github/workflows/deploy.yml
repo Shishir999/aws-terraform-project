@@ -1,0 +1,159 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v1
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+        working-directory: terraform
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: terraform
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+        working-directory: terraform
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        working-directory: terraform
+
+      - name: Get Terraform Output
+        id: terraform-output
+        run: |
+          # Get raw output and extract just the IP address
+          EC2_IP=$(terraform output -raw public_ip 2>&1 | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
+          
+          if [ -z "$EC2_IP" ]; then
+            echo "ERROR: Could not extract valid IP address from Terraform output"
+            exit 1
+          fi
+          
+          echo "Extracted IP: $EC2_IP"
+          echo "EC2_IP=$EC2_IP" >> $GITHUB_ENV
+          echo "$EC2_IP" > $GITHUB_WORKSPACE/ec2_ip.txt
+        working-directory: terraform
+  
+      - name: Debug Files
+        run: |
+          echo "Current directory: $(pwd)"
+          echo "Files in workspace:"
+          ls -la
+          echo "IP file contents:"
+          cat $GITHUB_WORKSPACE/ec2_ip.txt || echo "No ec2_ip.txt found"
+        
+      - name: Wait for EC2 Instance to be Ready
+        run: sleep 45  # Increased wait time for instance initialization
+
+      - name: Setup SSH Private Key
+        run: |
+          mkdir -p ~/.ssh
+          # Properly format the private key with newlines
+          cat <<EOF > ~/.ssh/id_rsa
+          ${{ secrets.SSH_PRIVATE_KEY }}
+          EOF
+          chmod 600 ~/.ssh/id_rsa
+          
+          # Verify key format
+          if ! ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub; then
+            echo "ERROR: Invalid SSH private key format"
+            exit 1
+          fi
+          
+          IP=$(cat $GITHUB_WORKSPACE/ec2_ip.txt)
+          echo "Adding SSH key for IP: $IP"
+          ssh-keyscan -H "$IP" >> ~/.ssh/known_hosts
+
+      - name: Test SSH Connection
+        run: |
+          IP=$(cat $GITHUB_WORKSPACE/ec2_ip.txt)
+          echo "Testing SSH connection to $IP"
+          ssh -i ~/.ssh/id_rsa \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=30 \
+              -o BatchMode=yes \
+              ec2-user@$IP echo "SSH connection successful" || exit 1
+
+      - name: SSH into EC2 and Deploy Docker with Nginx
+        run: |
+          IP=$(cat $GITHUB_WORKSPACE/ec2_ip.txt)
+          echo "Using IP Address: $IP"
+          
+          ssh -i ~/.ssh/id_rsa \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=30 \
+              ec2-user@$IP << 'EOF'
+          # Update system and install Docker
+          sudo dnf update -y
+          sudo dnf install -y docker git
+          
+          # Configure firewall (if enabled)
+          if sudo systemctl is-active --quiet firewalld; then
+            sudo firewall-cmd --permanent --add-port=80/tcp
+            sudo firewall-cmd --reload
+          fi
+          
+          # Start and enable Docker
+          sudo systemctl enable --now docker
+          sudo usermod -aG docker ec2-user
+          
+          # Verify Docker is running
+          sudo systemctl status docker
+          
+          # Create direct Docker command (simpler than Ansible for debugging)
+          sudo docker run -d \
+            --name nginx_server \
+            --restart unless-stopped \
+            -p 80:80 \
+            nginx
+          
+          # Wait for container to initialize
+          sleep 15
+          
+          # Debugging information
+          echo "=== Docker Containers ==="
+          sudo docker ps -a
+          
+          echo "=== Nginx Container Logs ==="
+          sudo docker logs nginx_server
+          
+          echo "=== Port Binding Check ==="
+          sudo ss -tulnp | grep 80 || true
+          sudo iptables -t nat -L -n -v | grep 80 || true
+          
+          echo "=== Container Inspection ==="
+          sudo docker inspect nginx_server | grep -A 10 HostConfig
+          
+          echo "=== Final Curl Test ==="
+          curl -v --retry 3 --retry-delay 5 http://127.0.0.1:80 || \
+          (echo "Curl failed, trying alternative methods..." && \
+           sudo docker exec nginx_server curl -I http://localhost && \
+           sudo docker exec nginx_server nginx -t)
+          EOF
